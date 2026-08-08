@@ -1,17 +1,19 @@
 package edu.eci.arsw.blacklist;
 
 import java.time.Duration;
-import java.time.Instant; 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.Future;
 
 /**
- * Laboratory implementation: students must complete this class.
+ * Laboratory implementation: consults every provider concurrently using a
+ * fixed-size platform-thread pool. Performs a complete scan of the provider
+ * list and returns matches in ascending order.
  */
 public final class FixedPoolBlackListSearch implements BlackListSearch {
     private final List<BlackListProvider> providers;
@@ -27,59 +29,43 @@ public final class FixedPoolBlackListSearch implements BlackListSearch {
 
     @Override
     public SearchResult search(String ipAddress, int alarmThreshold) {
-        Instant start = Instant.now();
-        
-        AtomicInteger alarms = new AtomicInteger(0);
-        AtomicInteger checked = new AtomicInteger(0);
-        List<Integer> matchingProviderIds = new CopyOnWriteArrayList<>(); 
-        
-        int totalProviders = providers.size();
-        
-        if (totalProviders == 0) {
-            return new SearchResult(ipAddress, matchingProviderIds, 0, Duration.between(start, Instant.now()));
+        Objects.requireNonNull(ipAddress, "ipAddress");
+        if (alarmThreshold <= 0) {
+            throw new IllegalArgumentException("alarmThreshold must be greater than zero");
         }
 
-        int actualThreads = Math.min(poolSize, totalProviders);
-        int chunkSize = totalProviders / actualThreads;
-        
-        CountDownLatch latch = new CountDownLatch(actualThreads);
+        long startedAt = System.nanoTime();
+        List<Integer> matches = new ArrayList<>();
+        int consulted = 0;
 
+        List<Future<Integer>> futures = new ArrayList<>(providers.size());
         try (ExecutorService executor = Executors.newFixedThreadPool(poolSize)) {
-            for (int i = 0; i < actualThreads; i++) {
-                final int startIndex = i * chunkSize;
-                final int endIndex = (i == actualThreads - 1) ? totalProviders : (i + 1) * chunkSize;
-
-                executor.submit(() -> {
-                    try {
-                        for (int j = startIndex; j < endIndex; j++) {
-
-                            if (alarms.get() >= alarmThreshold) {
-                                break;
-                            }
-
-                            BlackListProvider provider = providers.get(j);
-                            checked.incrementAndGet();
-
-                            if (provider.isBlacklisted(ipAddress)) {
-                                matchingProviderIds.add(provider.id());
-                                alarms.incrementAndGet();
-                            }
-                        }
-                    } finally {
-                        latch.countDown();
-                    }
-                });
+            for (BlackListProvider provider : providers) {
+                futures.add(executor.submit(
+                        () -> provider.isBlacklisted(ipAddress) ? provider.id() : null));
             }
-            
-            try {
-                latch.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            for (Future<Integer> future : futures) {
+                Integer matchingId = waitForResult(future);
+                consulted++;
+                if (matchingId != null) {
+                    matches.add(matchingId);
+                }
             }
         }
 
-        Instant end = Instant.now();
+        Collections.sort(matches);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
+        return new SearchResult(ipAddress, matches, consulted, elapsed);
+    }
 
-        return new SearchResult(ipAddress, matchingProviderIds, checked.get(), Duration.between(start, end));
+    private static Integer waitForResult(Future<Integer> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Search interrupted while waiting for providers", e);
+        } catch (ExecutionException e) {
+            throw new IllegalStateException("Provider consultation failed", e.getCause());
+        }
     }
 }
