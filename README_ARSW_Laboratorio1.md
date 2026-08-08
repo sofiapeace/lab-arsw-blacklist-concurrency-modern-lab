@@ -445,16 +445,16 @@ Complete this table with actual measurements:
 
 | Scenario | Strategy | Pool size | Average ms | Minimum ms | Maximum ms | Speedup | Matches | Consulted |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| No simulated I/O | Sequential | — | Pending | Pending | Pending | 1.00 | Pending | Pending |
-| No simulated I/O | Fixed pool | 2 | Pending | Pending | Pending | Pending | Pending | Pending |
-| No simulated I/O | Fixed pool | 4 | Pending | Pending | Pending | Pending | Pending | Pending |
-| No simulated I/O | Fixed pool | 8 | Pending | Pending | Pending | Pending | Pending | Pending |
-| No simulated I/O | Virtual threads | — | Pending | Pending | Pending | Pending | Pending | Pending |
-| Simulated I/O | Sequential | — | Pending | Pending | Pending | 1.00 | Pending | Pending |
-| Simulated I/O | Fixed pool | 2 | Pending | Pending | Pending | Pending | Pending | Pending |
-| Simulated I/O | Fixed pool | 4 | Pending | Pending | Pending | Pending | Pending | Pending |
-| Simulated I/O | Fixed pool | 8 | Pending | Pending | Pending | Pending | Pending | Pending |
-| Simulated I/O | Virtual threads | — | Pending | Pending | Pending | Pending | Pending | Pending |
+| No simulated I/O | Sequential | — | 0.007 | 0.005 | 0.012 | 1.00 | 7 | 100 |
+| No simulated I/O | Fixed pool | 2 | 0.262 | 0.189 | 0.416 | 0.03 | 7 | 100 |
+| No simulated I/O | Fixed pool | 4 | 0.333 | 0.320 | 0.365 | 0.02 | 7 | 100 |
+| No simulated I/O | Fixed pool | 8 | 0.443 | 0.406 | 0.478 | 0.02 | 7 | 100 |
+| No simulated I/O | Virtual threads | — | 0.390 | 0.242 | 0.474 | 0.02 | 7 | 100 |
+| Simulated I/O | Sequential | — | 11260.235 | 11227.221 | 11303.817 | 1.00 | 7 | 100 |
+| Simulated I/O | Fixed pool | 2 | 5664.929 | 5651.239 | 5679.442 | 1.99 | 7 | 100 |
+| Simulated I/O | Fixed pool | 4 | 2900.718 | 2892.418 | 2912.849 | 3.88 | 7 | 100 |
+| Simulated I/O | Fixed pool | 8 | 1511.382 | 1509.027 | 1516.314 | 7.45 | 7 | 100 |
+| Simulated I/O | Virtual threads | — | 198.096 | 197.913 | 198.499 | 56.84 | 7 | 100 |
 
 Also include the raw measurements in:
 
@@ -481,32 +481,82 @@ Answer every question with evidence from the experiment.
 ### 15.1 Correctness
 
 1. How did the team verify that the three strategies produce equivalent results?
+
+> Con dos mecanismos: una suite de 9 pruebas JUnit que compara los IDs, el número de proveedores consultados y la clasificación de confianza de cada estrategia (pools de 2, 4 y 8 y virtual threads) contra la línea base secuencial; y (b) el `BenchmarkRunner`, que verifica en **cada corrida medida** que el resultado sea idéntico al secuencial y aborta si no lo es. Las 50 mediciones registradas reportan los mismos 7 matches y 100 consultados.
+
 2. Why can concurrent tasks return matches in a different order?
+
+> Porque el planificador (del SO para hilos de plataforma, de la JVM para virtual threads) decide en qué orden se ejecutan y terminan las tareas, y eso varía entre corridas. El proveedor 90 puede responder antes que el 13. Por eso el orden de llegada es no determinista, y ordenamos los IDs ascendentemente antes de construir el `SearchResult`.
+
 3. What mechanism or design prevented lost or duplicated matches?
+
+> Diseño sin estado mutable compartido: cada tarea consulta **un** proveedor y devuelve su propio resultado (el ID si hay match, `null` si no) a través de un `Future`. El hilo principal consolida los resultados con `Future.get()`, así que ningún hilo escribe en una colección compartida. Cada proveedor se envía exactamente una vez, luego no puede haber duplicados ni pérdidas: la condición de carrera se elimina por diseño en lugar de mitigarse con locks.
+
 4. Why should performance not be compared before proving functional equivalence?
+
+> Porque un benchmark entre estrategias que calculan cosas distintas no compara nada. Lo vivimos en el laboratorio: la primera versión concurrente tenía un cortocircuito y devolvía 50 matches donde el secuencial encontraba 77 — era "más rápida" precisamente porque hacía menos trabajo. La correctitud define qué se está midiendo; sin ella el tiempo es un número sin significado.
 
 ### 15.2 Fixed thread pool
 
 5. What changed when the pool increased from 2 to 4 threads?
+
+> Con I/O simulado el tiempo promedio bajó de 5664.9 ms a 2900.7 ms (speedup de 1.99 a 3.88): casi exactamente la mitad, porque el trabajo dominante es espera bloqueante y se reparte entre el doble de hilos. Sin I/O ocurrió lo contrario: el promedio *subió* de 0.262 ms a 0.333 ms, porque no hay espera que repartir y solo se agregó más coordinación.
+
 6. What changed when the pool increased from 4 to 8 threads?
+
+> Mismo patrón: con I/O el promedio bajó de 2900.7 ms a 1511.4 ms (speedup 7.45), de nuevo cerca de la mitad. Sin I/O volvió a empeorar (0.333 ms → 0.443 ms). Más hilos solo ayudan cuando hay bloqueo que solapar.
+
 7. Was the improvement proportional to the number of threads? Explain.
+
+> Con I/O fue casi proporcional pero siempre un poco por debajo del ideal: 1.99x con 2 hilos, 3.88x con 4, 7.45x con 8. La diferencia frente al ideal (2x, 4x, 8x) viene del desbalanceo de carga —las latencias por proveedor van de 20 a 200 ms, así que un hilo puede quedarse con tareas más lentas mientras otros terminan— más el costo fijo de crear el pool y consolidar resultados. Es el comportamiento que predice la ley de Amdahl cuando existe una fracción no paralelizable.
+
 8. What costs are introduced by task creation, scheduling, context switching, and result consolidation?
+
+> El escenario sin I/O los aísla perfectamente: el trabajo real toma 0.007 ms en secuencial, pero cualquier variante concurrente tarda entre 0.26 y 0.44 ms — entre 35 y 60 veces más lento. Ese sobrecosto es crear el executor y sus hilos, encolar 100 tareas, los cambios de contexto y recorrer 100 futures. Con I/O ese mismo costo (~0.3 ms) es despreciable frente a los ~11 000 ms de espera que se ahorran.
+
 9. What would happen if the pool size were much larger than the available platform threads?
+
+> Los hilos de plataforma son hilos del SO (~1-2 MB de pila cada uno). Un pool mucho mayor que los 10 procesadores lógicos de la máquina no agrega paralelismo real para trabajo de CPU: agrega memoria consumida y más cambios de contexto. Para trabajo bloqueante sí permitiría más esperas simultáneas (con 100 hilos el escenario I/O se acercaría al tiempo del proveedor más lento), pero a un costo por hilo alto — que es exactamente el problema que los virtual threads resuelven baratos.
 
 ### 15.3 Virtual threads
 
 10. In which scenario did virtual threads provide the clearest benefit?
+
+> En el escenario con I/O bloqueante, de forma contundente: 198.1 ms promedio contra 11 260.2 ms del secuencial — un speedup de 56.84x, y 7.6 veces más rápido que el mejor pool fijo (8 hilos). El tiempo total quedó pegado al proveedor más lento (~200 ms), que es el límite teórico cuando las 100 consultas se lanzan a la vez.
+
 11. Why are virtual threads especially relevant for blocking operations?
+
+> Porque cuando un virtual thread se bloquea (en este caso en `Thread.sleep`, en producción en una llamada de red o base de datos), la JVM lo *desmonta* del hilo de plataforma que lo transporta y ese hilo queda libre para ejecutar otro virtual thread. Bloquear deja de desperdiciar un recurso caro del SO. Eso permite tener las 100 esperas en curso simultáneamente con apenas ~10 hilos de plataforma, algo inviable con un pool fijo de tamaño razonable.
+
 12. Why do virtual threads not make local CPU work automatically faster?
+
+> Porque no crean capacidad de cómputo: los virtual threads se ejecutan sobre los mismos ~10 núcleos de la máquina. Solo cambian la economía del *bloqueo*. Nuestros datos lo muestran: sin I/O, los virtual threads (0.390 ms) fueron ~55 veces más lentos que el secuencial (0.007 ms), igual de penalizados por el overhead de coordinación que el pool fijo.
+
 13. What trade-offs remain even when virtual threads are lightweight?
+
+> Siguen existiendo: (a) el costo de coordinación y consolidación de resultados, visible en el escenario sin I/O; (b) el orden no determinista de terminación, que obliga a ordenar resultados; (c) la depuración y el monitoreo de miles de hilos efímeros es menos madura que la de pools clásicos; (d) el código que usa `synchronized` sobre operaciones bloqueantes puede *anclar* (pinning) el virtual thread a su hilo de plataforma y degradar el beneficio; y (e) no sirven para limitar concurrencia — con 100 tareas simultáneas un servicio externo real podría recibirnos como un ataque; un pool fijo actúa además como regulador (throttle).
 
 ### 15.4 Architectural decision
 
 14. Which strategy would the team recommend for a system dominated by blocking external calls?
+
+> Virtual threads. Es el caso de uso para el que fueron diseñados y donde la evidencia es más clara (speedup de 56.84x). Además el código resultante es el más simple: una tarea por consulta, sin decidir un tamaño de pool.
+
 15. Which strategy would the team recommend for a small local workload?
+
+> Ejecución secuencial. Sin I/O, cualquier forma de concurrencia fue decenas de veces más lenta que el secuencial (0.007 ms vs 0.26–0.44 ms). Para trabajo local pequeño, la solución más simple es también la más rápida y la más fácil de mantener.
+
 16. Under what conditions would a fixed pool still be preferable?
+
+> Cuando se necesita **limitar** la concurrencia, no maximizarla: proveedores externos con límite de peticiones simultáneas o cuotas, conexiones a base de datos acotadas por un pool, control de presión sobre servicios aguas abajo, o trabajo CPU-bound donde lo óptimo es un pool del tamaño del número de núcleos. También en bases de código con mucho `synchronized` bloqueante, donde los virtual threads sufren pinning.
+
 17. What evidence from the measurements supports the recommendation?
+
+> La tabla de la sección 14: con I/O, virtual threads promedió 198.1 ms contra 11 260.2 ms del secuencial y 1511.4 ms del mejor pool fijo; el speedup del pool creció casi linealmente con los hilos (1.99x → 3.88x → 7.45x) pero siempre acotado por el tamaño del pool, mientras los virtual threads alcanzaron el límite físico del problema (el proveedor más lento, ~200 ms). Sin I/O, el secuencial ganó por más de un orden de magnitud a todas las variantes concurrentes. Las 50 mediciones produjeron resultados funcionales idénticos (7 matches, 100 consultados), así que la comparación es válida.
+
 18. What limitations prevent generalizing the conclusion to every production system?
+
+> La latencia es simulada con `Thread.sleep`, que es perfectamente paralelizable; una red real tiene límites de ancho de banda, pools de conexiones, timeouts y fallos. El trabajo "local" del mock es trivial, no representa cargas CPU-bound reales. Se midió en una sola máquina (Apple M5, 10 núcleos) con 100 proveedores y 5 corridas; otros tamaños de problema, hardware o JVMs pueden desplazar los puntos de equilibrio. Y no medimos consumo de memoria ni comportamiento bajo carga sostenida, solo latencia de una búsqueda a la vez.
 
 Answers such as “virtual threads are better” or “more threads are faster” are insufficient without conditions and evidence.
 
@@ -527,7 +577,7 @@ The conclusion must include:
 
 ### Team conclusion
 
-> Replace this text with the team conclusion.
+> La carga de trabajo de este problema está dominada por operaciones bloqueantes: cada consulta a un proveedor espera entre 20 y 200 ms simulando una llamada de red, de modo que el tiempo secuencial (11 260 ms en promedio) es casi en su totalidad espera, no cómputo. Bajo esa característica, la evidencia medida es concluyente: el pool fijo escaló de forma casi lineal con el número de hilos (speedup de 1.99x con 2, 3.88x con 4 y 7.45x con 8), mientras que los hilos virtuales, al lanzar las 100 consultas simultáneamente, redujeron el tiempo a 198 ms —un speedup de 56.84x— quedando acotados por el proveedor más lento. Recomendamos por tanto hilos virtuales para sistemas dominados por llamadas externas bloqueantes, siempre que los servicios consultados toleren esa concurrencia simultánea; cuando existe un límite de peticiones concurrentes o la carga es CPU-bound, un pool fijo dimensionado según ese límite sigue siendo preferible porque actúa como regulador. El trade-off principal es que la concurrencia no es gratuita: en el escenario sin I/O toda variante concurrente fue más de 35 veces más lenta que la ejecución secuencial (0.26–0.44 ms contra 0.007 ms) por el costo de coordinación. La principal limitación del experimento es que la latencia simulada con `Thread.sleep` es perfectamente paralelizable y no captura límites reales de red, conexiones o fallos, y que se midió en una sola máquina con un único tamaño de problema.
 
 ---
 
@@ -537,21 +587,15 @@ Each student must add an individual conclusion of 80 to 120 words.
 
 ### Student 1
 
-**Name:** Pending
+**Name:** Sofia Garcia
 
-> Replace this text with the individual conclusion.
+> Al implementar las estrategias concurrentes aprendí que la correctitud es anterior al rendimiento. Mi primera versión detenía la búsqueda al alcanzar el umbral de alarmas y parecía funcionar, pero rompía la equivalencia con la línea base: devolvía 50 coincidencias donde el secuencial encontraba 77. Entendí que un resultado "más rápido" que calcula algo distinto no es una optimización sino un error. También comprobé el valor de diseñar sin estado mutable compartido: al pasar de acumular en una lista compartida a consolidar resultados con `Future.get()`, la condición de carrera desapareció por diseño y no por parches con estructuras atómicas. La concurrencia exige verificar, no suponer.
 
 ### Student 2
 
-**Name:** Pending
+**Name:** Jose Lancheros
 
-> Replace this text with the individual conclusion.
-
-### Student 3
-
-**Name:** Pending
-
-> Replace this text with the individual conclusion.
+> Lo que más me marcó fue medir el costo real de la coordinación. Antes del laboratorio asumía que más hilos significaban más velocidad; los datos mostraron lo contrario para trabajo local: sin I/O simulado, toda variante concurrente fue más de 35 veces más lenta que la secuencial (0.26–0.44 ms contra 0.007 ms). En cambio, con latencia bloqueante los hilos virtuales redujeron 11.3 segundos a 198 ms, un speedup de 56.84x, acotado por el proveedor más lento. Concluyo que la decisión arquitectónica correcta depende de caracterizar la carga bloqueante o de cómputo y de medir con una metodología reproducible: warm-ups, corridas repetidas y verificación de equivalencia en cada ejecución.
 
 ---
 
@@ -589,23 +633,26 @@ Complete:
 
 | Item | Value |
 |---|---|
-| Operating system | Pending |
-| CPU model | Pending |
-| Logical processors | Pending |
-| RAM | Pending |
-| JDK vendor and version | Pending |
-| Maven version | Pending |
-| Measurement date | Pending |
+| Operating system | macOS 26.5.2 (build 25F84) |
+| CPU model | Apple M5 |
+| Logical processors | 10 |
+| RAM | 24 GB |
+| JDK vendor and version | Homebrew OpenJDK 21.0.11 |
+| Maven version | Apache Maven 3.9.16 |
+| Measurement date | 2026-08-07 |
+
+See [results/environment.md](results/environment.md) for the full methodology. Raw measurements are in [results/results.csv](results/results.csv), reproducible with `./run-benchmark.sh`.
 
 ---
 
 ## 20. Team members and contribution evidence
 
-| Student | GitHub username | Main contribution | Relevant commits |
-|---|---|---|---|
-| Pending | Pending | Pending | Pending |
-| Pending | Pending | Pending | Pending |
-| Pending | Pending | Pending | Pending |
+This team has two members.
+
+| Student | GitHub username | Main contribution | Relevant commits                                                       |
+|---|---|---|------------------------------------------------------------------------|
+| Sofia | sofiapeace | Implementación inicial de las estrategias concurrentes y primeras pruebas automatizadas | `22ccbd5`, `02f10c0`                                                   |
+| Jose | Lanch3ros | Corrección del contrato de escaneo completo, suite de pruebas de equivalencia, benchmark runner, mediciones y documentación | fix complete-scan contract, extend benchmark runner, benchmark results |
 
 Each student must have at least two meaningful commits.
 
@@ -730,7 +777,7 @@ Complete the following table:
 
 | Tool | Purpose | Main prompts or activities | Validation performed | Changes made by the team |
 |---|---|---|---|---|
-| Pending | Pending | Pending | Pending | Pending |
+| Claude Code | Apoyo en diagnóstico, corrección de código, benchmark y documentación | Explicación del enunciado y del estado del repositorio; diagnóstico del fallo de equivalencia (cortocircuito vs. escaneo completo); reescritura de `FixedPoolBlackListSearch` y `VirtualThreadBlackListSearch` con el patrón de consolidación por `Future`; ampliación de la suite de pruebas; extensión de `BenchmarkRunner`; script de benchmark y llenado de tablas con los datos medidos | `mvn clean test` (9 pruebas en verde); verificación automática de equivalencia contra la línea base secuencial en cada una de las 50 corridas medidas; revisión manual del código por el equipo antes de cada commit | El equipo revisó y commiteó cada cambio, ejecutó las mediciones en su propia máquina y redactó las conclusiones individuales y la revisión final de la conclusión grupal |
 
 Requirements:
 
@@ -781,22 +828,22 @@ Analyze:
 
 Before submission, verify:
 
-- [ ] The project uses Java 21.
-- [ ] `mvn clean test` passes.
-- [ ] Fixed pools of 2, 4, and 8 threads work.
-- [ ] The virtual-thread strategy works.
-- [ ] All mandatory strategies return equivalent results.
-- [ ] Results are ordered and contain no duplicates.
-- [ ] The benchmark runner supports the required arguments.
-- [ ] Two warm-ups and five measured runs were executed.
-- [ ] All ten required configurations were measured.
-- [ ] `results/results.csv` contains raw measurements.
-- [ ] The environment is documented.
-- [ ] The results table is complete.
-- [ ] All analysis questions are answered.
-- [ ] The team conclusion is complete.
-- [ ] Every student added an individual conclusion.
-- [ ] Every student has meaningful commits.
-- [ ] AI use is declared.
-- [ ] The `lab-1-final` tag was pushed.
-- [ ] The repository URL was submitted in the institutional platform.
+- [X] The project uses Java 21.
+- [X] `mvn clean test` passes.
+- [X] Fixed pools of 2, 4, and 8 threads work.
+- [X] The virtual-thread strategy works.
+- [X] All mandatory strategies return equivalent results.
+- [X] Results are ordered and contain no duplicates.
+- [X] The benchmark runner supports the required arguments.
+- [X] Two warm-ups and five measured runs were executed.
+- [X] All ten required configurations were measured.
+- [X] `results/results.csv` contains raw measurements.
+- [X] The environment is documented.
+- [X] The results table is complete.
+- [X] All analysis questions are answered.
+- [X] The team conclusion is complete.
+- [X] Every student added an individual conclusion.
+- [X] Every student has meaningful commits.
+- [X] AI use is declared.
+- [X] The `lab-1-final` tag was pushed.
+- [X] The repository URL was submitted in the institutional platform.
