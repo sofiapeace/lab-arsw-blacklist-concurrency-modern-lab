@@ -48,3 +48,4 @@ replay_pid*
 *.tmp
 *.swp
 *~
+hs_err_pid*.log
